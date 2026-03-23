@@ -1,0 +1,52 @@
+.\" SPDX-License-Identifier: LGPL-2.1-or-later
+.TH SYSTEMD\-RECALLD.SERVICE 8 "2026-03-23" "systemd-recalld 0.1.0" "System Manager"
+.SH NAME
+systemd-recalld.service, systemd-recalld \- desktop audio and video capture daemon
+.SH SYNOPSIS
+.B systemd-recalld
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B systemd-recalld
+is a daemon that continuously captures desktop audio and video activity.
+Audio is captured via ALSA or PulseAudio, and video is captured via X11
+or Wayland display protocols. Captured data is stored locally with
+AES-256-GCM encryption and can be queried through the companion
+.BR systemd-recall-query-service (8).
+.PP
+The daemon exposes a D-Bus interface at
+.B org.freedesktop.systemd.recalld
+for runtime control. Use
+.BR recallctl (1)
+to interact with it.
+.SH OPTIONS
+.TP
+.BI \-c " PATH" "\fR, \fP" \-\-config= PATH
+Path to configuration file. Defaults to
+.IR /etc/systemd/recalld/recalld.conf .
+.TP
+.BR \-h ", " \-\-help
+Show help and exit.
+.TP
+.B \-\-version
+Show version and exit.
+.SH CONFIGURATION
+See
+.I /etc/systemd/recalld/recalld.conf
+for configuration options including audio/video capture settings,
+privacy controls, encryption, and storage management.
+.SH FILES
+.TP
+.I /etc/systemd/recalld/recalld.conf
+Main configuration file.
+.TP
+.I /var/lib/systemd/recalld/
+Default storage directory for captured data.
+.TP
+.I /usr/share/dbus-1/system.d/org.freedesktop.systemd.recalld.conf
+D-Bus policy file.
+.SH SEE ALSO
+.BR recallctl (1),
+.BR systemd-recall-query-service (8),
+.BR systemd (1)
+.SH LICENSE
+LGPL-2.1-or-later

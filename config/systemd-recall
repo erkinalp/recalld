@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# /etc/pam.d/systemd-recall
+# PAM configuration for systemd-recall-query-service authentication
+#
+
+# Standard system authentication
+auth       required     pam_unix.so
+auth       requisite    pam_deny.so
+
+# Account management
+account    required     pam_unix.so
+account    sufficient   pam_localuser.so
+
+# Session management
+session    required     pam_unix.so
+
+# Password management
+password   required     pam_unix.so

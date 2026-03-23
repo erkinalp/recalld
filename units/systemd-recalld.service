@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# systemd-recalld.service — Desktop audio and video capture daemon
+#
+
+[Unit]
+Description=Desktop Audio and Video Capture Daemon
+Documentation=man:systemd-recalld(8)
+After=graphical.target dbus.service
+Wants=dbus.service
+ConditionPathExists=/etc/systemd/recalld/recalld.conf
+
+[Service]
+Type=notify
+ExecStart=/usr/lib/systemd/systemd-recalld
+Restart=on-failure
+RestartSec=5
+
+# Security
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_NET_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+# Device access for audio and video capture
+DeviceAllow=/dev/snd/* rw
+DeviceAllow=/dev/video* rw
+DeviceAllow=/dev/dri/* rw
+
+# State directory
+StateDirectory=systemd/recalld
+CacheDirectory=systemd/recalld
+LogsDirectory=systemd/recalld
+
+# Resource management
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+CPUWeight=50
+MemoryMax=2G
+
+# Watchdog
+WatchdogSec=30
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,58 @@
+.\" SPDX-License-Identifier: LGPL-2.1-or-later
+.TH SYSTEMD\-RECALL\-QUERY\-SERVICE.SERVICE 8 "2026-03-23" "systemd-recalld 0.1.0" "System Manager"
+.SH NAME
+systemd-recall-query-service.service, systemd-recall-query-service \- AI-powered query service for captured data
+.SH SYNOPSIS
+.B systemd-recall-query-service
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B systemd-recall-query-service
+provides a REST API for querying data captured by
+.BR systemd-recalld (8).
+It uses AI models (Whisper for audio, CLIP for video, BERT for text,
+Flamingo for multimodal) to process and search through captured content.
+.PP
+Authentication is handled via PAM with JWT tokens for API access.
+The API supports TLS encryption and rate limiting.
+.SH OPTIONS
+.TP
+.BI \-c " PATH" "\fR, \fP" \-\-config= PATH
+Path to configuration file. Defaults to
+.IR /etc/systemd/recall-query-service/recall-query-service.conf .
+.TP
+.BR \-h ", " \-\-help
+Show help and exit.
+.TP
+.B \-\-version
+Show version and exit.
+.SH API ENDPOINTS
+.TP
+.B POST /api/v1/auth
+Authenticate with username and password. Returns a JWT token.
+.TP
+.B POST /api/v1/query
+Submit a natural language query. Requires Bearer token authentication.
+.SH CONFIGURATION
+See
+.I /etc/systemd/recall-query-service/recall-query-service.conf
+for configuration options including API settings, AI model paths,
+authentication, and storage.
+.SH FILES
+.TP
+.I /etc/systemd/recall-query-service/recall-query-service.conf
+Main configuration file.
+.TP
+.I /etc/systemd/recall-query-service/jwt-secret
+JWT signing secret (must be generated before first use).
+.TP
+.I /etc/pam.d/systemd-recall
+PAM configuration for authentication.
+.TP
+.I /var/lib/systemd/recall-query-service/
+Default storage and model directory.
+.SH SEE ALSO
+.BR recallctl (1),
+.BR systemd-recalld (8),
+.BR systemd (1)
+.SH LICENSE
+LGPL-2.1-or-later

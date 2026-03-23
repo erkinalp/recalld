@@ -1,0 +1,72 @@
+.\" SPDX-License-Identifier: LGPL-2.1-or-later
+.TH RECALLCTL 1 "2026-03-23" "systemd-recalld 0.1.0" "User Commands"
+.SH NAME
+recallctl \- control the systemd-recalld capture daemon
+.SH SYNOPSIS
+.B recallctl
+.RI [ OPTIONS ]
+.I COMMAND
+.RI [ ARGUMENTS ]
+.SH DESCRIPTION
+.B recallctl
+is the command-line interface for controlling the
+.BR systemd-recalld (8)
+desktop audio and video capture daemon. It communicates with the daemon
+via D-Bus.
+.SH COMMANDS
+.TP
+.B status
+Show the current capture status, including whether capture is active,
+the number of stored captures, and total storage used.
+.TP
+.B start
+Start capturing audio and video from the desktop.
+.TP
+.B stop
+Stop all active captures.
+.TP
+.B pause
+Temporarily pause capturing without stopping the daemon.
+.TP
+.B resume
+Resume capturing after a pause.
+.TP
+.BI list " [TYPE]"
+List stored captures. TYPE can be
+.BR audio ", " video ", or " screenshot .
+Defaults to
+.BR audio .
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show help message and exit.
+.TP
+.B \-\-version
+Show version and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure (connection error, invalid command, etc.)
+.SH EXAMPLES
+.nf
+# Check if capture is running
+recallctl status
+
+# Start capture
+recallctl start
+
+# Pause and resume
+recallctl pause
+recallctl resume
+
+# List recent audio captures
+recallctl list audio
+.fi
+.SH SEE ALSO
+.BR systemd-recalld (8),
+.BR systemd-recall-query-service (8)
+.SH LICENSE
+LGPL-2.1-or-later
