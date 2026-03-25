@@ -3,11 +3,16 @@
 **The way people think Windows Recall works.**
 
 systemd-recalld is a desktop audio and video capture daemon for Linux,
-integrated with systemd. It continuously captures your desktop activity
-— audio from microphones and system output, video from your display —
-and stores it locally with strong encryption. A companion query service
-powered by AI models lets you search through your captured history using
-natural language.
+designed to work with systemd. It continuously captures your desktop
+activity — audio from microphones and system output, video from your
+display — and stores it locally with strong encryption. A companion
+query service powered by AI models lets you search through your captured
+history using natural language.
+
+> **Note:** systemd-recalld is *not* an official component of the
+> [systemd project](https://github.com/systemd/systemd). It is an
+> independent project that integrates with systemd through its public
+> APIs (sd-bus, sd-daemon, sd-notify, service units).
 
 Unlike Microsoft's Windows Recall which is purely local, systemd-recalld
 is designed with a client-server architecture: the capture daemon runs
@@ -96,7 +101,7 @@ Requirements:
 
 - Meson >= 0.60.0
 - GCC or Clang with C11 support
-- libsystemd >= 250
+- libsystemd >= 249
 - SQLite >= 3.35.0
 - OpenSSL >= 1.1.0
 - D-Bus
