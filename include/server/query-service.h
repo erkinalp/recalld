@@ -47,5 +47,18 @@ int query_service_process(
                 const QueryRequest *req,
                 QueryResponse *ret_resp);
 
+/* Ingest captured data received from a remote client.
+ * Stores the data in the server-side storage and indexes it for queries. */
+int query_service_ingest(
+                QueryService *svc,
+                CaptureType type,
+                const uint8_t *data,
+                size_t data_len,
+                int duration_ms,
+                const char *source);
+
+/* Get the underlying storage handle for direct ingestion by the HTTP server */
+StorageHandle* query_service_get_storage(QueryService *svc);
+
 void query_response_free(QueryResponse *resp);
 void query_request_free(QueryRequest *req);

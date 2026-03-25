@@ -5,6 +5,7 @@ client_deps = [
         dep_threads,
         dep_systemd,
         dep_dbus,
+        dep_openssl,
 ]
 
 if dep_alsa.found()
@@ -26,6 +27,7 @@ endif
 client_sources = files(
         'audio-capture.c',
         'video-capture.c',
+        'network-transmit.c',
         'dbus-service.c',
         'recalld-daemon.c',
 )

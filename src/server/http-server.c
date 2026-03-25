@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 
 #include "server/http-server.h"
@@ -281,6 +282,152 @@ static int handle_query(HttpServer *srv, const HttpRequest *req, HttpResponse *r
         return 0;
 }
 
+static int handle_ingest(HttpServer *srv, const HttpRequest *req, HttpResponse *resp) {
+        JwtClaims claims = {};
+        int r;
+
+        /* Validate JWT token */
+        if (srv->config.auth_required) {
+                r = validate_token(srv, req->auth_header, &claims);
+                if (r < 0) {
+                        resp->status = 401;
+                        resp->body = strdup("{\"error\":\"unauthorized\"}");
+                        resp->body_len = strlen(resp->body);
+                        snprintf(resp->content_type, sizeof(resp->content_type), "application/json");
+                        jwt_claims_free(&claims);
+                        return 0;
+                }
+        }
+
+        if (!req->body || req->body_len == 0)
+                goto bad_request;
+
+        /* Parse ingest request from JSON body:
+         * {"type":"audio|video|screenshot","duration_ms":N,"source":"...","data":"<base64>"} */
+        {
+                CaptureType type = _CAPTURE_TYPE_INVALID;
+                int duration_ms = 0;
+                char source[256] = "remote-ingest";
+
+                /* Parse type */
+                char *t = strstr(req->body, "\"type\":\"");
+                if (t) {
+                        t += 8;
+                        char *end = strchr(t, '"');
+                        if (end) {
+                                char type_str[32];
+                                snprintf(type_str, sizeof(type_str), "%.*s", (int)(end - t), t);
+                                type = capture_type_from_string(type_str);
+                        }
+                }
+
+                if (type == _CAPTURE_TYPE_INVALID)
+                        goto bad_request;
+
+                /* Parse duration_ms */
+                char *d = strstr(req->body, "\"duration_ms\":");
+                if (d) {
+                        d += 14;
+                        duration_ms = atoi(d);
+                }
+
+                /* Parse source */
+                char *s = strstr(req->body, "\"source\":\"");
+                if (s) {
+                        s += 10;
+                        char *end = strchr(s, '"');
+                        if (end)
+                                snprintf(source, sizeof(source), "%.*s", (int)(end - s), s);
+                }
+
+                /* Parse data (base64-encoded payload).
+                 * For now, accept raw bytes after the JSON header if Content-Type
+                 * indicates multipart, or the "data" field for JSON payloads. */
+                char *data_field = strstr(req->body, "\"data\":\"");
+                if (data_field) {
+                        data_field += 8;
+                        char *data_end = strchr(data_field, '"');
+                        if (!data_end)
+                                goto bad_request;
+
+                        size_t encoded_len = (size_t)(data_end - data_field);
+
+                        /* Base64 decode the payload using OpenSSL EVP */
+                        size_t decoded_max = encoded_len * 3 / 4 + 3;
+                        uint8_t *decoded = malloc(decoded_max);
+                        if (!decoded) {
+                                jwt_claims_free(&claims);
+                                return log_oom(), -ENOMEM;
+                        }
+
+                        int decoded_len = EVP_DecodeBlock(decoded, (const unsigned char *) data_field, (int) encoded_len);
+                        if (decoded_len < 0) {
+                                free(decoded);
+                                goto bad_request;
+                        }
+
+                        /* EVP_DecodeBlock may over-count due to padding; adjust for trailing '=' */
+                        if (encoded_len > 0 && data_field[encoded_len - 1] == '=')
+                                decoded_len--;
+                        if (encoded_len > 1 && data_field[encoded_len - 2] == '=')
+                                decoded_len--;
+
+                        r = query_service_ingest(srv->query_svc, type,
+                                        decoded, (size_t) decoded_len,
+                                        duration_ms, source);
+                        free(decoded);
+
+                        if (r < 0) {
+                                resp->status = 500;
+                                resp->body = strdup("{\"error\":\"ingest_failed\"}");
+                                resp->body_len = strlen(resp->body);
+                                snprintf(resp->content_type, sizeof(resp->content_type),
+                                         "application/json");
+                                jwt_claims_free(&claims);
+                                return 0;
+                        }
+                } else {
+                        /* No data field — try to ingest the raw body as binary data.
+                         * This supports the bulk binary protocol from the client transmitter. */
+                        r = query_service_ingest(srv->query_svc, type,
+                                        (const uint8_t *) req->body, req->body_len,
+                                        duration_ms, source);
+                        if (r < 0) {
+                                resp->status = 500;
+                                resp->body = strdup("{\"error\":\"ingest_failed\"}");
+                                resp->body_len = strlen(resp->body);
+                                snprintf(resp->content_type, sizeof(resp->content_type),
+                                         "application/json");
+                                jwt_claims_free(&claims);
+                                return 0;
+                        }
+                }
+
+                r = asprintf(&resp->body,
+                        "{\"status\":\"ok\",\"type\":\"%s\",\"duration_ms\":%d,\"source\":\"%s\"}",
+                        capture_type_to_string(type), duration_ms, source);
+                if (r < 0) {
+                        jwt_claims_free(&claims);
+                        return -ENOMEM;
+                }
+
+                resp->body_len = (size_t) r;
+                resp->status = 200;
+                snprintf(resp->content_type, sizeof(resp->content_type), "application/json");
+        }
+
+        jwt_claims_free(&claims);
+        return 0;
+
+bad_request:
+        resp->status = 400;
+        resp->body = strdup("{\"error\":\"invalid_ingest_request\"}");
+        resp->body_len = strlen(resp->body);
+        snprintf(resp->content_type, sizeof(resp->content_type), "application/json");
+        jwt_claims_free(&claims);
+        return 0;
+}
+
 static void handle_client(HttpServer *srv, int client_fd) {
         SSL *ssl = NULL;
         char buf[HTTP_MAX_REQUEST_SIZE];
@@ -314,6 +461,8 @@ static void handle_client(HttpServer *srv, int client_fd) {
                 handle_auth(srv, &req, &resp);
         else if (strcmp(req.path, "/api/v1/query") == 0 && strcmp(req.method, "POST") == 0)
                 handle_query(srv, &req, &resp);
+        else if (strcmp(req.path, "/api/v1/ingest") == 0 && strcmp(req.method, "POST") == 0)
+                handle_ingest(srv, &req, &resp);
         else {
                 resp.status = 404;
                 resp.body = strdup("{\"error\":\"not_found\"}");

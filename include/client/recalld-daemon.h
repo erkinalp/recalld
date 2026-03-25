@@ -8,12 +8,14 @@
 #include "common/recalld-storage.h"
 #include "client/audio-capture.h"
 #include "client/video-capture.h"
+#include "client/network-transmit.h"
 
 typedef struct RecalldDaemon {
         RecalldConfig config;
         StorageHandle *storage;
         AudioCaptureContext *audio;
         VideoCaptureContext *video;
+        NetworkTransmitter *transmitter;
         sd_bus *bus;
 
         bool capturing;

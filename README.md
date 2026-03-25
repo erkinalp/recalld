@@ -22,42 +22,46 @@ machine with GPU acceleration for AI inference.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│                  Client                     │
-│                                             │
-│  ┌─────────────┐  ┌──────────────────────┐  │
-│  │ Audio       │  │ Video                │  │
-│  │ Capture     │  │ Capture              │  │
-│  │ (ALSA/      │  │ (X11/Wayland         │  │
-│  │  PulseAudio)│  │  reverse VNC)        │  │
-│  └──────┬──────┘  └──────────┬───────────┘  │
-│         │                    │              │
-│         └────────┬───────────┘              │
-│                  ▼                          │
-│         ┌────────────────┐                  │
-│         │ Storage        │                  │
-│         │ (SQLite +      │                  │
-│         │  AES-256-GCM)  │                  │
-│         └────────────────┘                  │
-│                  │                          │
-│         ┌────────────────┐                  │
-│         │ D-Bus Service  │◄── recallctl     │
-│         └────────────────┘                  │
-└─────────────────────────────────────────────┘
-                   │
-                   ▼ (transmission)
-┌─────────────────────────────────────────────┐
-│                  Server                     │
-│                                             │
-│  ┌────────────────┐  ┌──────────────────┐   │
-│  │ HTTP/TLS API   │  │ PAM Auth + JWT   │   │
-│  └───────┬────────┘  └──────────────────┘   │
-│          ▼                                  │
-│  ┌────────────────────────────────────────┐ │
-│  │ Query Service                          │ │
-│  │ (Whisper, CLIP, BERT, Flamingo)        │ │
-│  └────────────────────────────────────────┘ │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                    Client                        │
+│                                                  │
+│  ┌─────────────┐  ┌──────────────────────┐       │
+│  │ Audio       │  │ Video                │       │
+│  │ Capture     │  │ Capture              │       │
+│  │ (ALSA/      │  │ (X11/Wayland)        │       │
+│  │  PulseAudio)│  │                      │       │
+│  └──────┬──────┘  └──────────┬───────────┘       │
+│         │                    │                   │
+│         └────────┬───────────┘                   │
+│                  ▼                               │
+│  ┌────────────────┐    ┌───────────────────────┐ │
+│  │ Local Storage  │    │ Network Transmitter   │ │
+│  │ (SQLite +      │    │                       │ │
+│  │  AES-256-GCM)  │    │ Audio → Reverse RTP   │ │
+│  └────────────────┘    │ Video → Reverse VNC   │ │
+│         │              │ Bulk  → HTTPS/RCLD    │ │
+│  ┌────────────────┐    └───────────┬───────────┘ │
+│  │ D-Bus Service  │◄── recallctl   │             │
+│  └────────────────┘                │             │
+└────────────────────────────────────┼─────────────┘
+                                     │ TLS
+                                     ▼
+┌──────────────────────────────────────────────────┐
+│                    Server                        │
+│                                                  │
+│  ┌──────────────────────────────────────────┐    │
+│  │ HTTP/TLS API                             │    │
+│  │                                          │    │
+│  │ POST /api/v1/auth    → PAM + JWT         │    │
+│  │ POST /api/v1/ingest  → Store captures    │    │
+│  │ POST /api/v1/query   → Query Service     │    │
+│  └───────────┬──────────────────────────────┘    │
+│              ▼                                   │
+│  ┌──────────────────────────────────────────┐    │
+│  │ Query Service                            │    │
+│  │ (Whisper, CLIP, BERT, Flamingo)          │    │
+│  └──────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────┘
 ```
 
 ## Components
@@ -194,6 +198,12 @@ curl -X POST https://server:8080/api/v1/auth \
 curl -X POST https://server:8080/api/v1/query \
   -H "Authorization: Bearer <token>" \
   -d '{"query":"what did I discuss in yesterday meeting?"}'
+
+# Ingest data from a remote client (used by the daemon automatically,
+# or manually for bulk uploads)
+curl -X POST https://server:8080/api/v1/ingest \
+  -H "Authorization: Bearer <token>" \
+  -d '{"type":"audio","duration_ms":5000,"source":"workstation-1","data":"..."}'
 ```
 
 ## Privacy & Security
