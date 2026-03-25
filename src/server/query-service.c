@@ -158,6 +158,41 @@ int query_service_process(
         return 0;
 }
 
+int query_service_ingest(
+                QueryService *svc,
+                CaptureType type,
+                const uint8_t *data,
+                size_t data_len,
+                int duration_ms,
+                const char *source) {
+
+        int r;
+
+        if (!svc || !data || data_len == 0)
+                return -EINVAL;
+        if (!svc->running)
+                return -ENOTCONN;
+        if (type < 0 || type >= _CAPTURE_TYPE_MAX)
+                return -EINVAL;
+
+        r = storage_store(svc->storage, type, data, data_len,
+                          source ? source : "remote-ingest", duration_ms);
+        if (r < 0) {
+                log_error_errno(-r, "Failed to ingest %s data (%zu bytes): %m",
+                                capture_type_to_string(type), data_len);
+                return r;
+        }
+
+        log_info("Ingested %s data: %zu bytes, %d ms from '%s'.",
+                 capture_type_to_string(type), data_len, duration_ms,
+                 source ? source : "remote-ingest");
+        return 0;
+}
+
+StorageHandle* query_service_get_storage(QueryService *svc) {
+        return svc ? svc->storage : NULL;
+}
+
 void query_response_free(QueryResponse *resp) {
         if (!resp)
                 return;

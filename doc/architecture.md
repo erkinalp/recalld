@@ -181,6 +181,39 @@ The command-line tool communicates with the daemon exclusively through D-Bus.
 It provides a simple interface for all daemon operations without requiring
 direct access to storage files or configuration.
 
+### Network Transmitter (`src/client/network-transmit.c`)
+
+The network transmitter module handles client-to-server data transmission using
+two specialized protocols and a bulk fallback:
+
+- **Reverse RTP** (audio): The client acts as the RTP sender, pushing audio
+  frames to the server. Each packet contains a standard 12-byte RTP header
+  (RFC 3550) with payload type 111 (Opus), followed by the audio payload.
+  "Reverse" because the client initiates the connection to the server, inverting
+  the traditional media streaming model where a server sends to clients.
+
+- **Reverse VNC** (video): The client acts as a VNC server, pushing
+  FramebufferUpdate messages (RFB protocol) to the server which acts as a
+  VNC viewer. Each frame is sent as an RFB FramebufferUpdate with a single
+  rectangle covering the full screen. Supports Raw (default), ZLib, and Tight
+  encodings.
+
+- **Bulk HTTPS**: For batch uploads of stored data, the transmitter sends
+  a binary `RCLD` framed message containing a BulkIngestHeader followed by
+  the capture payload.
+
+The transmitter supports:
+- TLS encryption for all connections
+- Configurable bandwidth limits
+- Automatic retry with reconnection on failure
+- Per-connection statistics tracking (bytes/packets sent, failures, retransmissions)
+
+Configuration via `[Network]` section in `recalld.conf`:
+- `Compression` — "none", "low", "medium", "high"
+- `MaxBandwidthKbps` — bandwidth cap (0 = unlimited)
+- `RetryCount` / `RetryDelaySeconds` — retry policy
+- `UseMeteredConnections` — whether to transmit over metered links
+
 ### HTTP Server (`src/server/http-server.c`)
 
 The server provides a REST API with:
@@ -191,6 +224,10 @@ The server provides a REST API with:
   in JSON, authenticates via PAM, returns a JWT token.
 - **Query endpoint** (`POST /api/v1/query`): Accepts natural language queries
   with optional time range and content type filters. Requires Bearer token.
+- **Ingest endpoint** (`POST /api/v1/ingest`): Receives captured audio/video
+  data from remote clients. Accepts JSON with `type`, `duration_ms`, `source`,
+  and `data` fields, or raw binary body. Ingested data is stored in the server's
+  storage and becomes queryable immediately.
 - **Connection handling**: Each client connection is handled synchronously in
   the accept thread. A production deployment should add a thread pool.
 
@@ -216,11 +253,18 @@ JWT token handling for API authentication:
 
 ### Query Service (`src/server/query-service.c`)
 
-The query service currently provides time-based and type-based filtering of
-stored captures. The AI model integration (Whisper, CLIP, BERT, Flamingo)
-is designed to be loaded as separate inference modules. The current
-implementation queries the storage layer directly and returns results ranked
-by timestamp.
+The query service provides time-based and type-based filtering of stored
+captures, operating on both locally stored and remotely ingested data:
+
+- **Query processing**: Searches across all capture types (audio, video,
+  screenshot) with optional time range and content type filters. Results are
+  ranked by timestamp.
+- **Data ingestion**: The `query_service_ingest()` function receives captured
+  data from remote clients (via the HTTP ingest endpoint) and stores it in the
+  server-side storage. Ingested data is immediately available for queries.
+- **AI model integration**: Whisper (audio), CLIP (video), BERT (text), and
+  Flamingo (multimodal) are designed to be loaded as separate inference modules.
+  The current implementation queries the storage layer directly.
 
 ## Build System
 

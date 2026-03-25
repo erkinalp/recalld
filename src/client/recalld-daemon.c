@@ -17,6 +17,9 @@
 #include "common/recalld-log.h"
 #include "common/recalld-storage.h"
 
+static uint32_t audio_rtp_timestamp = 0;
+static uint32_t video_frame_number = 0;
+
 static void audio_data_handler(
                 const uint8_t *data,
                 size_t len,
@@ -25,12 +28,23 @@ static void audio_data_handler(
                 void *userdata) {
 
         RecalldDaemon *daemon = userdata;
+        int duration_ms;
 
         if (!daemon || !daemon->storage)
                 return;
 
-        storage_store(daemon->storage, CAPTURE_AUDIO, data, len, "audio-capture",
-                      (int)(len * 1000 / ((size_t) sample_rate * (size_t) channels * 2)));
+        duration_ms = (int)(len * 1000 / ((size_t) sample_rate * (size_t) channels * 2));
+
+        /* Store locally */
+        storage_store(daemon->storage, CAPTURE_AUDIO, data, len, "audio-capture", duration_ms);
+
+        /* Transmit to server via reverse RTP if enabled */
+        if (daemon->transmitter &&
+            network_transmitter_get_state(daemon->transmitter) == TRANSMIT_STATE_CONNECTED) {
+                audio_rtp_timestamp += (uint32_t)(len / ((size_t) channels * 2));
+                network_transmit_audio_rtp(daemon->transmitter, data, len,
+                                           sample_rate, channels, audio_rtp_timestamp);
+        }
 }
 
 static void video_data_handler(
@@ -45,7 +59,15 @@ static void video_data_handler(
         if (!daemon || !daemon->storage)
                 return;
 
+        /* Store locally */
         storage_store(daemon->storage, CAPTURE_VIDEO, data, len, "video-capture", 0);
+
+        /* Transmit to server via reverse VNC (RFB) if enabled */
+        if (daemon->transmitter &&
+            network_transmitter_get_state(daemon->transmitter) == TRANSMIT_STATE_CONNECTED) {
+                network_transmit_video_vnc(daemon->transmitter, data, len,
+                                           width, height, video_frame_number++);
+        }
 }
 
 int daemon_new(RecalldDaemon **ret, const char *config_path) {
@@ -120,6 +142,34 @@ int daemon_new(RecalldDaemon **ret, const char *config_path) {
                         log_warning_errno(-r, "Failed to initialize video capture, continuing without: %m");
         }
 
+        /* Initialize network transmitter if transmission is enabled */
+        if (d->config.transmission_enabled && d->config.server_address) {
+                NetworkTransmitConfig ncfg = {
+                        .server_address = d->config.server_address,
+                        .server_port = 8080,
+                        .tls_enabled = true,
+                        .auth_token = NULL,
+                        .max_bandwidth_kbps = d->config.max_bandwidth_kbps,
+                        .compression = d->config.compression,
+                        .retry_count = d->config.retry_count,
+                        .retry_delay_seconds = d->config.retry_delay_seconds,
+                        .use_metered = d->config.use_metered,
+                        .rtp_payload_type = 111, /* Opus */
+                        .rtp_ssrc = (int) getpid(),
+                        .vnc_encoding = 0, /* Raw */
+                        .vnc_quality = 8,
+                };
+
+                r = network_transmitter_new(&d->transmitter, &ncfg);
+                if (r < 0)
+                        log_warning_errno(-r, "Failed to initialize network transmitter, continuing without: %m");
+                else {
+                        r = network_transmitter_connect(d->transmitter);
+                        if (r < 0)
+                                log_warning_errno(-r, "Failed to connect to server, will retry later: %m");
+                }
+        }
+
         /* Initialize D-Bus */
         r = dbus_service_init(&d->bus);
         if (r < 0) {
@@ -153,6 +203,7 @@ RecalldDaemon* daemon_free(RecalldDaemon *daemon) {
 
         audio_capture_free(daemon->audio);
         video_capture_free(daemon->video);
+        network_transmitter_free(daemon->transmitter);
         storage_close(daemon->storage);
         recalld_config_free(&daemon->config);
         free(daemon);
