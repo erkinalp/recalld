@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -75,13 +76,18 @@ int query_service_stop(QueryService *svc) {
         return 0;
 }
 
+/* Convert an FTS5 rank score (negative, closer to 0 = more relevant) to
+ * a 0.0–1.0 confidence value.  We use 1/(1+|rank|) which maps the
+ * entire negative half-line onto (0, 1]. */
+static double rank_to_confidence(double rank) {
+        return 1.0 / (1.0 + fabs(rank));
+}
+
 int query_service_process(
                 QueryService *svc,
                 const QueryRequest *req,
                 QueryResponse *ret_resp) {
 
-        CaptureMetadata *entries = NULL;
-        int count = 0;
         struct timespec ts_start, ts_end;
         double elapsed;
         int r;
@@ -95,7 +101,67 @@ int query_service_process(
 
         memset(ret_resp, 0, sizeof(*ret_resp));
 
-        /* Search across all capture types if not specified, otherwise parse content_types */
+        /* ---- Full-text search path ---- */
+        if (req->query_text && req->query_text[0] != '\0') {
+                SearchResult *search_results = NULL;
+                int search_count = 0;
+
+                /* Determine the type filter: _CAPTURE_TYPE_INVALID (-1) means "any" */
+                CaptureType type_filter = _CAPTURE_TYPE_INVALID;
+                if (req->content_types) {
+                        /* If exactly one type is requested, pass it through.
+                         * For multiple types or "all", use -1. */
+                        int n_types = 0;
+                        CaptureType last = _CAPTURE_TYPE_INVALID;
+                        for (int t = 0; t < _CAPTURE_TYPE_MAX; t++) {
+                                const char *ts = capture_type_to_string((CaptureType) t);
+                                if (strstr(req->content_types, ts)) {
+                                        last = (CaptureType) t;
+                                        n_types++;
+                                }
+                        }
+                        if (n_types == 1)
+                                type_filter = last;
+                }
+
+                r = storage_search(svc->storage, req->query_text,
+                                   type_filter,
+                                   req->time_from, req->time_to,
+                                   &search_results, &search_count,
+                                   req->max_results > 0 ? req->max_results : 0);
+                if (r < 0) {
+                        log_warning_errno(-r, "Full-text search failed: %m");
+                        /* Fall through to time-based listing below */
+                        goto time_based;
+                }
+
+                if (search_count > 0) {
+                        ret_resp->results = calloc((size_t) search_count, sizeof(QueryResult));
+                        if (!ret_resp->results) {
+                                storage_search_result_free(search_results, search_count);
+                                return log_oom(), -ENOMEM;
+                        }
+
+                        for (int i = 0; i < search_count; i++) {
+                                QueryResult *qr = &ret_resp->results[i];
+                                qr->capture_id = search_results[i].capture_id;
+                                qr->confidence = rank_to_confidence(search_results[i].rank);
+                                qr->summary = search_results[i].summary ? strdup(search_results[i].summary) : NULL;
+                                qr->content_type = strdup(capture_type_to_string(search_results[i].type));
+                                qr->timestamp = search_results[i].timestamp;
+                                qr->duration_ms = search_results[i].duration_ms;
+                        }
+
+                        ret_resp->result_count = search_count;
+                }
+
+                storage_search_result_free(search_results, search_count);
+                ret_resp->total_matches = ret_resp->result_count;
+                goto finish;
+        }
+
+time_based:
+        /* ---- Time-range listing path (original behaviour) ---- */
         for (int t = 0; t < _CAPTURE_TYPE_MAX; t++) {
                 CaptureMetadata *type_entries = NULL;
                 int type_count = 0;
@@ -108,7 +174,8 @@ int query_service_process(
 
                 r = storage_list(svc->storage, (CaptureType) t,
                                  req->time_from, req->time_to,
-                                 &type_entries, &type_count);
+                                 &type_entries, &type_count,
+                                 req->max_results);
                 if (r < 0) {
                         log_warning_errno(-r, "Failed to query %s captures: %m",
                                           capture_type_to_string((CaptureType) t));
@@ -149,6 +216,7 @@ int query_service_process(
         if (req->max_results > 0 && ret_resp->result_count > req->max_results)
                 ret_resp->result_count = req->max_results;
 
+finish:
         clock_gettime(CLOCK_MONOTONIC, &ts_end);
         elapsed = (double)(ts_end.tv_sec - ts_start.tv_sec) * 1000.0 +
                   (double)(ts_end.tv_nsec - ts_start.tv_nsec) / 1000000.0;
