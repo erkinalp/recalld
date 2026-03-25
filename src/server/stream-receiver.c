@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <endian.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -152,7 +153,6 @@ static StreamProtocol detect_protocol(int fd, SSL *ssl) {
  * For long-lived connections we keep reading until EOF / error. */
 static int handle_rtp_stream(int fd, SSL *ssl, QueryService *query_svc) {
         RtpHeader hdr;
-        uint8_t payload[STREAM_MAX_PACKET_SIZE];
         int r;
 
         log_info("Stream receiver: RTP audio session started.");
@@ -193,17 +193,27 @@ static int handle_rtp_stream(int fd, SSL *ssl, QueryService *query_svc) {
 
                 /* If nothing pending, try to read one standard frame */
                 size_t payload_len = avail > 0 ? (size_t) avail : 960;
-                if (payload_len > sizeof(payload))
-                        payload_len = sizeof(payload);
+                if (payload_len > STREAM_MAX_PACKET_SIZE)
+                        payload_len = STREAM_MAX_PACKET_SIZE;
+
+                uint8_t *payload = malloc(payload_len);
+                if (!payload) {
+                        log_oom();
+                        break;
+                }
 
                 r = recv_exact(fd, ssl, payload, payload_len);
-                if (r < 0)
+                if (r < 0) {
+                        free(payload);
                         break;
+                }
 
                 r = query_service_ingest(query_svc, CAPTURE_AUDIO,
                                 payload, payload_len,
                                 /* duration_ms= */ 20,  /* ~20ms per Opus frame */
                                 "rtp-stream");
+                free(payload);
+
                 if (r < 0)
                         log_warning_errno(-r, "Stream receiver: failed to ingest RTP audio: %m");
         }
