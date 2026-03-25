@@ -12,6 +12,7 @@
 #include "server/http-server.h"
 #include "server/jwt.h"
 #include "server/query-service.h"
+#include "server/stream-receiver.h"
 #include "common/recalld-config.h"
 #include "common/recalld-log.h"
 
@@ -43,6 +44,7 @@ int main(int argc, char *argv[]) {
         QueryService *query_svc = NULL;
         JwtContext *jwt = NULL;
         HttpServer *http = NULL;
+        StreamReceiver *stream = NULL;
         const char *config_path = NULL;
         int c, r;
 
@@ -111,8 +113,26 @@ int main(int argc, char *argv[]) {
                 goto finish;
         }
 
+        /* Start the streaming protocol receiver on a separate port for
+         * direct RTP/VNC/Bulk connections from recalld clients. */
+        r = stream_receiver_new(&stream, &config, query_svc);
+        if (r < 0) {
+                log_error_errno(-r, "Failed to initialize stream receiver: %m");
+                goto finish;
+        }
+
+        if (stream) {
+                r = stream_receiver_start(stream);
+                if (r < 0) {
+                        log_warning_errno(-r, "Failed to start stream receiver: %m");
+                        /* Non-fatal — HTTP ingest still works */
+                }
+        }
+
         sd_notify(/* unset= */ 0, "READY=1\nSTATUS=Running");
-        log_info("Service ready, listening on port %d.", config.port);
+        log_info("Service ready, HTTP on port %d%s.",
+                 config.port,
+                 stream_receiver_is_running(stream) ? ", stream receiver active" : "");
 
         while (!should_exit) {
                 sd_notify(/* unset= */ 0, "WATCHDOG=1");
@@ -122,6 +142,7 @@ int main(int argc, char *argv[]) {
         sd_notify(/* unset= */ 0, "STOPPING=1");
 
 finish:
+        stream_receiver_free(stream);
         http_server_free(http);
         query_service_free(query_svc);
         jwt_free(jwt);

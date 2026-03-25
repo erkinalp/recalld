@@ -340,6 +340,7 @@ void query_service_config_set_defaults(QueryServiceConfig *config) {
         config->shutdown_timeout_sec = 30;
 
         config->port = 8080;
+        config->stream_port = 8081;
         config->rate_limit_per_minute = 60;
         config->auth_required = true;
         config->tls_enabled = true;
@@ -468,6 +469,8 @@ int query_service_config_load(QueryServiceConfig *config, const char *path) {
                 } else if (strcmp(section, "API") == 0) {
                         if (strcmp(key, "Port") == 0)
                                 config->port = atoi(value);
+                        else if (strcmp(key, "StreamPort") == 0)
+                                config->stream_port = atoi(value);
                         else if (strcmp(key, "RateLimitPerMinute") == 0)
                                 config->rate_limit_per_minute = atoi(value);
                         else if (strcmp(key, "AuthenticationRequired") == 0) {

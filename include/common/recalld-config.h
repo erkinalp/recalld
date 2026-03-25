@@ -71,6 +71,7 @@ typedef struct QueryServiceConfig {
 
         /* [API] */
         int port;
+        int stream_port;        /* separate port for RTP/VNC/Bulk stream receiver, 0 = disabled */
         int rate_limit_per_minute;
         bool auth_required;
         bool tls_enabled;

@@ -16,6 +16,7 @@ server_sources = files(
         'jwt.c',
         'query-service.c',
         'http-server.c',
+        'stream-receiver.c',
 )
 
 lib_server = static_library(
