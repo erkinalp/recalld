@@ -114,20 +114,38 @@ const char* transmit_state_to_string(TransmitState state) {
 }
 
 static int transmit_send(NetworkTransmitter *t, const void *buf, size_t len) {
-        ssize_t n;
+        const uint8_t *p = buf;
+        size_t remaining = len;
 
-        if (t->ssl)
-                n = SSL_write(t->ssl, buf, (int) len);
-        else
-                n = write(t->sock_fd, buf, len);
+        while (remaining > 0) {
+                ssize_t n;
 
-        if (n < 0) {
-                t->stats.bytes_failed += len;
-                t->stats.packets_failed++;
-                return -errno;
+                if (t->ssl) {
+                        n = SSL_write(t->ssl, p, (int) remaining);
+                        if (n <= 0) {
+                                t->stats.bytes_failed += remaining;
+                                t->stats.packets_failed++;
+                                return errno != 0 ? -errno : -EIO;
+                        }
+                } else {
+                        n = write(t->sock_fd, p, remaining);
+                        if (n < 0) {
+                                t->stats.bytes_failed += remaining;
+                                t->stats.packets_failed++;
+                                return -errno;
+                        }
+                        if (n == 0) {
+                                t->stats.bytes_failed += remaining;
+                                t->stats.packets_failed++;
+                                return -ECONNRESET;
+                        }
+                }
+
+                p += n;
+                remaining -= (size_t) n;
         }
 
-        t->stats.bytes_sent += (uint64_t) n;
+        t->stats.bytes_sent += (uint64_t) len;
         t->stats.packets_sent++;
         return 0;
 }

@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 
 #include "server/http-server.h"
@@ -346,23 +347,44 @@ static int handle_ingest(HttpServer *srv, const HttpRequest *req, HttpResponse *
                 if (data_field) {
                         data_field += 8;
                         char *data_end = strchr(data_field, '"');
-                        if (data_end) {
-                                size_t encoded_len = (size_t)(data_end - data_field);
+                        if (!data_end)
+                                goto bad_request;
 
-                                /* Simple base64 decode — the data is the capture payload.
-                                 * For large payloads, bulk binary protocol is preferred. */
-                                r = query_service_ingest(srv->query_svc, type,
-                                                (const uint8_t *) data_field, encoded_len,
-                                                duration_ms, source);
-                                if (r < 0) {
-                                        resp->status = 500;
-                                        resp->body = strdup("{\"error\":\"ingest_failed\"}");
-                                        resp->body_len = strlen(resp->body);
-                                        snprintf(resp->content_type, sizeof(resp->content_type),
-                                                 "application/json");
-                                        jwt_claims_free(&claims);
-                                        return 0;
-                                }
+                        size_t encoded_len = (size_t)(data_end - data_field);
+
+                        /* Base64 decode the payload using OpenSSL EVP */
+                        size_t decoded_max = encoded_len * 3 / 4 + 3;
+                        uint8_t *decoded = malloc(decoded_max);
+                        if (!decoded) {
+                                jwt_claims_free(&claims);
+                                return log_oom(), -ENOMEM;
+                        }
+
+                        int decoded_len = EVP_DecodeBlock(decoded, (const unsigned char *) data_field, (int) encoded_len);
+                        if (decoded_len < 0) {
+                                free(decoded);
+                                goto bad_request;
+                        }
+
+                        /* EVP_DecodeBlock may over-count due to padding; adjust for trailing '=' */
+                        if (encoded_len > 0 && data_field[encoded_len - 1] == '=')
+                                decoded_len--;
+                        if (encoded_len > 1 && data_field[encoded_len - 2] == '=')
+                                decoded_len--;
+
+                        r = query_service_ingest(srv->query_svc, type,
+                                        decoded, (size_t) decoded_len,
+                                        duration_ms, source);
+                        free(decoded);
+
+                        if (r < 0) {
+                                resp->status = 500;
+                                resp->body = strdup("{\"error\":\"ingest_failed\"}");
+                                resp->body_len = strlen(resp->body);
+                                snprintf(resp->content_type, sizeof(resp->content_type),
+                                         "application/json");
+                                jwt_claims_free(&claims);
+                                return 0;
                         }
                 } else {
                         /* No data field — try to ingest the raw body as binary data.
