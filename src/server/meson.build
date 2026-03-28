@@ -12,6 +12,7 @@ if dep_pam.found()
 endif
 
 server_sources = files(
+        'ai-processor.c',
         'pam-auth.c',
         'jwt.c',
         'query-service.c',

@@ -9,6 +9,7 @@
 
 #include <systemd/sd-daemon.h>
 
+#include "server/ai-processor.h"
 #include "server/http-server.h"
 #include "server/jwt.h"
 #include "server/query-service.h"
@@ -45,6 +46,7 @@ int main(int argc, char *argv[]) {
         JwtContext *jwt = NULL;
         HttpServer *http = NULL;
         StreamReceiver *stream = NULL;
+        AiProcessor *ai = NULL;
         const char *config_path = NULL;
         int c, r;
 
@@ -129,10 +131,24 @@ int main(int argc, char *argv[]) {
                 }
         }
 
+        /* Start the AI processing pipeline to transcribe/OCR new captures */
+        r = ai_processor_new(&ai, &config, query_service_get_storage(query_svc));
+        if (r < 0) {
+                log_warning_errno(-r, "Failed to initialize AI processor: %m");
+                /* Non-fatal — search still works, just no auto-processing */
+        }
+
+        if (ai) {
+                r = ai_processor_start(ai);
+                if (r < 0)
+                        log_warning_errno(-r, "Failed to start AI processor: %m");
+        }
+
         sd_notify(/* unset= */ 0, "READY=1\nSTATUS=Running");
-        log_info("Service ready, HTTP on port %d%s.",
+        log_info("Service ready, HTTP on port %d%s%s.",
                  config.port,
-                 stream_receiver_is_running(stream) ? ", stream receiver active" : "");
+                 stream_receiver_is_running(stream) ? ", stream receiver active" : "",
+                 ai_processor_is_running(ai) ? ", AI processor active" : "");
 
         while (!should_exit) {
                 sd_notify(/* unset= */ 0, "WATCHDOG=1");
@@ -142,6 +158,7 @@ int main(int argc, char *argv[]) {
         sd_notify(/* unset= */ 0, "STOPPING=1");
 
 finish:
+        ai_processor_free(ai);
         stream_receiver_free(stream);
         http_server_free(http);
         query_service_free(query_svc);

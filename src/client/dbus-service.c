@@ -99,7 +99,7 @@ int dbus_method_list_captures(sd_bus_message *m, void *userdata, sd_bus_error *e
         if (type == _CAPTURE_TYPE_INVALID)
                 return sd_bus_error_set_errnof(error, EINVAL, "Invalid capture type: %s", type_str);
 
-        r = storage_list(daemon->storage, type, (time_t) from, (time_t) to, &entries, &count);
+        r = storage_list(daemon->storage, type, (time_t) from, (time_t) to, &entries, &count, /* limit= */ 0);
         if (r < 0)
                 return sd_bus_error_set_errnof(error, -r, "Failed to list captures");
 

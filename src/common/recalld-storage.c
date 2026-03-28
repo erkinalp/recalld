@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,14 @@
 struct StorageHandle {
         sqlite3 *db;
         char *data_dir;
+
+        /* Prepared statement cache — prepared once in storage_open(),
+         * reset+clear between uses. */
+        sqlite3_stmt *stmt_store;
+        sqlite3_stmt *stmt_list;
+        sqlite3_stmt *stmt_search;
+        sqlite3_stmt *stmt_update_text;
+        sqlite3_stmt *stmt_list_unprocessed;
 };
 
 static const char *capture_type_table[] = {
@@ -52,10 +61,25 @@ static int storage_init_db(sqlite3 *db) {
                 "  source TEXT,"
                 "  checksum TEXT,"
                 "  encrypted INTEGER DEFAULT 0,"
-                "  data_path TEXT NOT NULL"
+                "  data_path TEXT NOT NULL,"
+                "  transcript TEXT,"
+                "  ocr_text TEXT,"
+                "  summary TEXT,"
+                "  ai_processed INTEGER DEFAULT 0"
                 ");"
-                "CREATE INDEX IF NOT EXISTS idx_captures_timestamp ON captures(timestamp);"
-                "CREATE INDEX IF NOT EXISTS idx_captures_type ON captures(type);"
+
+                /* Composite index replaces the two individual ones */
+                "DROP INDEX IF EXISTS idx_captures_timestamp;"
+                "DROP INDEX IF EXISTS idx_captures_type;"
+                "CREATE INDEX IF NOT EXISTS idx_captures_type_timestamp "
+                "  ON captures(type, timestamp DESC);"
+
+                /* FTS5 full-text search index */
+                "CREATE VIRTUAL TABLE IF NOT EXISTS captures_fts USING fts5("
+                "  transcript, ocr_text, summary,"
+                "  content='captures', content_rowid='id'"
+                ");"
+
                 "CREATE TABLE IF NOT EXISTS metadata ("
                 "  key TEXT PRIMARY KEY,"
                 "  value TEXT"
@@ -69,6 +93,19 @@ static int storage_init_db(sqlite3 *db) {
                 sqlite3_free(err_msg);
                 return -EIO;
         }
+
+        /* Migrate existing databases: add new columns if they don't exist.
+         * ALTER TABLE ... ADD COLUMN is a no-op-safe idiom in SQLite — it
+         * returns SQLITE_ERROR when the column already exists, which we
+         * silently ignore. */
+        sqlite3_exec(db, "ALTER TABLE captures ADD COLUMN transcript TEXT;",
+                     /* callback= */ NULL, /* arg= */ NULL, /* errmsg= */ NULL);
+        sqlite3_exec(db, "ALTER TABLE captures ADD COLUMN ocr_text TEXT;",
+                     /* callback= */ NULL, /* arg= */ NULL, /* errmsg= */ NULL);
+        sqlite3_exec(db, "ALTER TABLE captures ADD COLUMN summary TEXT;",
+                     /* callback= */ NULL, /* arg= */ NULL, /* errmsg= */ NULL);
+        sqlite3_exec(db, "ALTER TABLE captures ADD COLUMN ai_processed INTEGER DEFAULT 0;",
+                     /* callback= */ NULL, /* arg= */ NULL, /* errmsg= */ NULL);
 
         return 0;
 }
@@ -108,6 +145,7 @@ int storage_open(StorageHandle **ret_handle, const char *db_path, const char *da
         /* Enable WAL mode for better concurrent access */
         sqlite3_exec(h->db, "PRAGMA journal_mode=WAL;", /* callback= */ NULL, /* arg= */ NULL, /* errmsg= */ NULL);
         sqlite3_exec(h->db, "PRAGMA synchronous=NORMAL;", /* callback= */ NULL, /* arg= */ NULL, /* errmsg= */ NULL);
+        sqlite3_exec(h->db, "PRAGMA mmap_size=268435456;", /* callback= */ NULL, /* arg= */ NULL, /* errmsg= */ NULL);
 
         r = storage_init_db(h->db);
         if (r < 0) {
@@ -117,6 +155,40 @@ int storage_open(StorageHandle **ret_handle, const char *db_path, const char *da
                 return r;
         }
 
+        /* Prepare cached statements */
+        sqlite3_prepare_v2(h->db,
+                "INSERT INTO captures (type, timestamp, duration_ms, data_size, source, data_path) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                -1, &h->stmt_store, /* tail= */ NULL);
+
+        sqlite3_prepare_v2(h->db,
+                "SELECT id, type, timestamp, duration_ms, data_size, source, checksum, encrypted "
+                "FROM captures WHERE type = ? AND timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp DESC LIMIT ?",
+                -1, &h->stmt_list, /* tail= */ NULL);
+
+        sqlite3_prepare_v2(h->db,
+                "SELECT c.id, c.type, c.timestamp, c.duration_ms, c.data_size, c.source, "
+                "       c.transcript, c.ocr_text, c.summary, f.rank "
+                "FROM captures_fts f "
+                "JOIN captures c ON c.id = f.rowid "
+                "WHERE captures_fts MATCH ? "
+                "  AND (? < 0 OR c.type = ?) "
+                "  AND c.timestamp >= ? AND c.timestamp <= ? "
+                "ORDER BY f.rank "
+                "LIMIT ?",
+                -1, &h->stmt_search, /* tail= */ NULL);
+
+        sqlite3_prepare_v2(h->db,
+                "UPDATE captures SET transcript = ?, ocr_text = ?, summary = ?, ai_processed = 1 "
+                "WHERE id = ?",
+                -1, &h->stmt_update_text, /* tail= */ NULL);
+
+        sqlite3_prepare_v2(h->db,
+                "SELECT id, type, timestamp, duration_ms, data_size, source, checksum, encrypted "
+                "FROM captures WHERE ai_processed = 0 ORDER BY timestamp ASC LIMIT ?",
+                -1, &h->stmt_list_unprocessed, /* tail= */ NULL);
+
         *ret_handle = h;
         return 0;
 }
@@ -125,11 +197,21 @@ void storage_close(StorageHandle *handle) {
         if (!handle)
                 return;
 
+        sqlite3_finalize(handle->stmt_store);
+        sqlite3_finalize(handle->stmt_list);
+        sqlite3_finalize(handle->stmt_search);
+        sqlite3_finalize(handle->stmt_update_text);
+        sqlite3_finalize(handle->stmt_list_unprocessed);
+
         if (handle->db)
                 sqlite3_close(handle->db);
 
         free(handle->data_dir);
         free(handle);
+}
+
+sqlite3* storage_get_db(StorageHandle *handle) {
+        return handle ? handle->db : NULL;
 }
 
 int storage_store(
@@ -167,16 +249,15 @@ int storage_store(
         }
         fclose(f);
 
-        /* Insert metadata into database */
-        r = sqlite3_prepare_v2(handle->db,
-                "INSERT INTO captures (type, timestamp, duration_ms, data_size, source, data_path) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                -1, &stmt, /* tail= */ NULL);
-        if (r != SQLITE_OK) {
+        /* Insert metadata into database using the cached statement */
+        stmt = handle->stmt_store;
+        if (!stmt) {
                 unlink(data_path);
-                return log_error_errno(EIO, "Failed to prepare SQL statement: %s",
-                                       sqlite3_errmsg(handle->db));
+                return log_error_errno(EIO, "Prepared statement not available");
         }
+
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
 
         sqlite3_bind_int(stmt, 1, (int) type);
         sqlite3_bind_int64(stmt, 2, (int64_t) now);
@@ -186,7 +267,6 @@ int storage_store(
         sqlite3_bind_text(stmt, 6, data_path, -1, SQLITE_STATIC);
 
         r = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
 
         if (r != SQLITE_DONE) {
                 unlink(data_path);
@@ -308,12 +388,12 @@ int storage_list(
                 time_t from,
                 time_t to,
                 CaptureMetadata **ret_entries,
-                int *ret_count) {
+                int *ret_count,
+                int limit) {
 
-        sqlite3_stmt *stmt = NULL;
+        sqlite3_stmt *stmt;
         CaptureMetadata *entries = NULL;
         int count = 0, capacity = 64;
-        int r;
 
         if (!handle || !ret_entries || !ret_count)
                 return -EINVAL;
@@ -322,28 +402,27 @@ int storage_list(
         if (!entries)
                 return log_oom(), -ENOMEM;
 
-        r = sqlite3_prepare_v2(handle->db,
-                "SELECT id, type, timestamp, duration_ms, data_size, source, checksum, encrypted "
-                "FROM captures WHERE type = ? AND timestamp >= ? AND timestamp <= ? "
-                "ORDER BY timestamp DESC",
-                -1, &stmt, /* tail= */ NULL);
-        if (r != SQLITE_OK) {
+        stmt = handle->stmt_list;
+        if (!stmt) {
                 free(entries);
                 return -EIO;
         }
 
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+
         sqlite3_bind_int(stmt, 1, (int) type);
         sqlite3_bind_int64(stmt, 2, (int64_t) from);
         sqlite3_bind_int64(stmt, 3, (int64_t)(to > 0 ? to : time(NULL)));
+        sqlite3_bind_int(stmt, 4, limit > 0 ? limit : 1000000);
 
         while (sqlite3_step(stmt) == SQLITE_ROW) {
                 if (count >= capacity) {
                         CaptureMetadata *tmp;
                         capacity *= 2;
-                        tmp = realloc(entries, capacity * sizeof(CaptureMetadata));
+                        tmp = realloc(entries, (size_t) capacity * sizeof(CaptureMetadata));
                         if (!tmp) {
                                 storage_metadata_free(entries, count);
-                                sqlite3_finalize(stmt);
                                 return log_oom(), -ENOMEM;
                         }
                         entries = tmp;
@@ -366,11 +445,227 @@ int storage_list(
                 count++;
         }
 
-        sqlite3_finalize(stmt);
+        *ret_entries = entries;
+        *ret_count = count;
+        return 0;
+}
+
+int storage_search(
+                StorageHandle *handle,
+                const char *query_text,
+                CaptureType type,
+                time_t from,
+                time_t to,
+                SearchResult **ret_results,
+                int *ret_count,
+                int limit) {
+
+        sqlite3_stmt *stmt;
+        SearchResult *results = NULL;
+        int count = 0, capacity = 64;
+
+        if (!handle || !query_text || !ret_results || !ret_count)
+                return -EINVAL;
+
+        results = calloc(capacity, sizeof(SearchResult));
+        if (!results)
+                return log_oom(), -ENOMEM;
+
+        stmt = handle->stmt_search;
+        if (!stmt) {
+                free(results);
+                return -EIO;
+        }
+
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+
+        sqlite3_bind_text(stmt, 1, query_text, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 2, (int) type);  /* -1 = any type */
+        sqlite3_bind_int(stmt, 3, (int) type);
+        sqlite3_bind_int64(stmt, 4, (int64_t) from);
+        sqlite3_bind_int64(stmt, 5, (int64_t)(to > 0 ? to : time(NULL)));
+        sqlite3_bind_int(stmt, 6, limit > 0 ? limit : 1000000);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+                if (count >= capacity) {
+                        SearchResult *tmp;
+                        capacity *= 2;
+                        tmp = realloc(results, (size_t) capacity * sizeof(SearchResult));
+                        if (!tmp) {
+                                storage_search_result_free(results, count);
+                                return log_oom(), -ENOMEM;
+                        }
+                        results = tmp;
+                }
+
+                SearchResult *sr = &results[count];
+                sr->capture_id = sqlite3_column_int64(stmt, 0);
+                sr->type = (CaptureType) sqlite3_column_int(stmt, 1);
+                sr->timestamp = (time_t) sqlite3_column_int64(stmt, 2);
+                sr->duration_ms = sqlite3_column_int(stmt, 3);
+                sr->data_size = (size_t) sqlite3_column_int64(stmt, 4);
+
+                const char *src = (const char*) sqlite3_column_text(stmt, 5);
+                sr->source = src ? strdup(src) : NULL;
+
+                const char *txt = (const char*) sqlite3_column_text(stmt, 6);
+                sr->transcript = txt ? strdup(txt) : NULL;
+
+                const char *ocr = (const char*) sqlite3_column_text(stmt, 7);
+                sr->ocr_text = ocr ? strdup(ocr) : NULL;
+
+                const char *sum = (const char*) sqlite3_column_text(stmt, 8);
+                sr->summary = sum ? strdup(sum) : NULL;
+
+                sr->rank = sqlite3_column_double(stmt, 9);
+                count++;
+        }
+
+        *ret_results = results;
+        *ret_count = count;
+        return 0;
+}
+
+int storage_update_text_fields(
+                StorageHandle *handle,
+                int64_t id,
+                const char *transcript,
+                const char *ocr_text,
+                const char *summary) {
+
+        sqlite3_stmt *stmt;
+        char *err_msg = NULL;
+        int r;
+
+        if (!handle)
+                return -EINVAL;
+
+        /* Update the main table */
+        stmt = handle->stmt_update_text;
+        if (!stmt)
+                return -EIO;
+
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+
+        sqlite3_bind_text(stmt, 1, transcript, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, ocr_text, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, summary, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 4, id);
+
+        r = sqlite3_step(stmt);
+        if (r != SQLITE_DONE)
+                return log_error_errno(EIO, "Failed to update text fields for capture %" PRId64 ": %s",
+                                       id, sqlite3_errmsg(handle->db)), -EIO;
+
+        /* Sync the FTS5 index: delete stale entry then re-insert */
+        r = sqlite3_exec(handle->db,
+                "INSERT INTO captures_fts(captures_fts, rowid, transcript, ocr_text, summary) "
+                "SELECT 'delete', id, transcript, ocr_text, summary FROM captures WHERE id = 0;",
+                /* callback= */ NULL, /* arg= */ NULL, &err_msg);
+        /* Ignore errors — the row may not exist in the FTS index yet */
+        sqlite3_free(err_msg);
+        err_msg = NULL;
+
+        /* Build a one-shot INSERT ... SELECT to populate FTS from the
+         * just-updated row in captures. */
+        sqlite3_stmt *fts_stmt = NULL;
+        r = sqlite3_prepare_v2(handle->db,
+                "INSERT INTO captures_fts(rowid, transcript, ocr_text, summary) "
+                "SELECT id, transcript, ocr_text, summary FROM captures WHERE id = ?",
+                -1, &fts_stmt, /* tail= */ NULL);
+        if (r != SQLITE_OK)
+                return log_error_errno(EIO, "Failed to prepare FTS sync: %s",
+                                       sqlite3_errmsg(handle->db)), -EIO;
+
+        sqlite3_bind_int64(fts_stmt, 1, id);
+        r = sqlite3_step(fts_stmt);
+        sqlite3_finalize(fts_stmt);
+
+        if (r != SQLITE_DONE)
+                return log_error_errno(EIO, "Failed to sync FTS index for capture %" PRId64 ": %s",
+                                       id, sqlite3_errmsg(handle->db)), -EIO;
+
+        log_debug("Updated text fields and FTS index for capture %" PRId64 ".", id);
+        return 0;
+}
+
+int storage_list_unprocessed(
+                StorageHandle *handle,
+                CaptureMetadata **ret_entries,
+                int *ret_count,
+                int limit) {
+
+        sqlite3_stmt *stmt;
+        CaptureMetadata *entries = NULL;
+        int count = 0, capacity = 64;
+
+        if (!handle || !ret_entries || !ret_count)
+                return -EINVAL;
+
+        entries = calloc(capacity, sizeof(CaptureMetadata));
+        if (!entries)
+                return log_oom(), -ENOMEM;
+
+        stmt = handle->stmt_list_unprocessed;
+        if (!stmt) {
+                free(entries);
+                return -EIO;
+        }
+
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+
+        sqlite3_bind_int(stmt, 1, limit > 0 ? limit : 100);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+                if (count >= capacity) {
+                        CaptureMetadata *tmp;
+                        capacity *= 2;
+                        tmp = realloc(entries, (size_t) capacity * sizeof(CaptureMetadata));
+                        if (!tmp) {
+                                storage_metadata_free(entries, count);
+                                return log_oom(), -ENOMEM;
+                        }
+                        entries = tmp;
+                }
+
+                CaptureMetadata *m = &entries[count];
+                m->id = sqlite3_column_int64(stmt, 0);
+                m->type = (CaptureType) sqlite3_column_int(stmt, 1);
+                m->timestamp = (time_t) sqlite3_column_int64(stmt, 2);
+                m->duration_ms = sqlite3_column_int(stmt, 3);
+                m->data_size = (size_t) sqlite3_column_int64(stmt, 4);
+
+                const char *src = (const char*) sqlite3_column_text(stmt, 5);
+                m->source = src ? strdup(src) : NULL;
+
+                const char *cksum = (const char*) sqlite3_column_text(stmt, 6);
+                m->checksum = cksum ? strdup(cksum) : NULL;
+
+                m->encrypted = sqlite3_column_int(stmt, 7);
+                m->ai_processed = false;
+                count++;
+        }
 
         *ret_entries = entries;
         *ret_count = count;
         return 0;
+}
+
+void storage_search_result_free(SearchResult *results, int count) {
+        if (!results)
+                return;
+
+        for (int i = 0; i < count; i++) {
+                free(results[i].source);
+                free(results[i].transcript);
+                free(results[i].ocr_text);
+                free(results[i].summary);
+        }
+
+        free(results);
 }
 
 int storage_get_metadata(StorageHandle *handle, int64_t id, CaptureMetadata *ret_meta) {
