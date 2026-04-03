@@ -450,6 +450,76 @@ int storage_list(
         return 0;
 }
 
+/* Sanitise user input for FTS5 MATCH.  Each whitespace-delimited token
+ * is wrapped in double-quotes so that FTS5 operators (AND, OR, NOT,
+ * NEAR, *, ^, etc.) and special characters are treated as literals.
+ * Embedded double-quotes inside tokens are doubled ("") per FTS5 rules.
+ *
+ * Returns a heap-allocated sanitised string, or NULL on OOM.
+ * The caller must free the result. */
+static char* sanitize_fts5_query(const char *raw) {
+        size_t raw_len, out_cap, out_len;
+        char *out;
+        const char *p;
+
+        if (!raw || !*raw)
+                return NULL;
+
+        raw_len = strlen(raw);
+        /* Worst case: every char is a '"' => doubled, plus quotes around
+         * each single-char token, plus spaces.  4x + 3 is generous. */
+        out_cap = raw_len * 4 + 3;
+        out = malloc(out_cap);
+        if (!out)
+                return NULL;
+
+        out_len = 0;
+        p = raw;
+
+        while (*p) {
+                /* Skip leading whitespace */
+                while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+                        p++;
+                if (!*p)
+                        break;
+
+                /* Separate tokens with a space (implicit AND in FTS5) */
+                if (out_len > 0)
+                        out[out_len++] = ' ';
+
+                /* Opening quote */
+                out[out_len++] = '"';
+
+                /* Copy token characters, doubling any embedded quotes */
+                while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+                        if (*p == '"') {
+                                out[out_len++] = '"';
+                                out[out_len++] = '"';
+                        } else {
+                                out[out_len++] = *p;
+                        }
+                        p++;
+
+                        /* Grow buffer if needed */
+                        if (out_len + 4 >= out_cap) {
+                                out_cap *= 2;
+                                char *tmp = realloc(out, out_cap);
+                                if (!tmp) {
+                                        free(out);
+                                        return NULL;
+                                }
+                                out = tmp;
+                        }
+                }
+
+                /* Closing quote */
+                out[out_len++] = '"';
+        }
+
+        out[out_len] = '\0';
+        return out;
+}
+
 int storage_search(
                 StorageHandle *handle,
                 const char *query_text,
@@ -463,24 +533,33 @@ int storage_search(
         sqlite3_stmt *stmt;
         SearchResult *results = NULL;
         int count = 0, capacity = 64;
+        char *safe_query = NULL;
 
         if (!handle || !query_text || !ret_results || !ret_count)
                 return -EINVAL;
 
-        results = calloc(capacity, sizeof(SearchResult));
-        if (!results)
+        /* Sanitise the raw user query to prevent FTS5 syntax errors */
+        safe_query = sanitize_fts5_query(query_text);
+        if (!safe_query)
                 return log_oom(), -ENOMEM;
+
+        results = calloc(capacity, sizeof(SearchResult));
+        if (!results) {
+                free(safe_query);
+                return log_oom(), -ENOMEM;
+        }
 
         stmt = handle->stmt_search;
         if (!stmt) {
                 free(results);
+                free(safe_query);
                 return -EIO;
         }
 
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
 
-        sqlite3_bind_text(stmt, 1, query_text, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 1, safe_query, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 2, (int) type);  /* -1 = any type */
         sqlite3_bind_int(stmt, 3, (int) type);
         sqlite3_bind_int64(stmt, 4, (int64_t) from);
@@ -492,10 +571,11 @@ int storage_search(
                         SearchResult *tmp;
                         capacity *= 2;
                         tmp = realloc(results, (size_t) capacity * sizeof(SearchResult));
-                        if (!tmp) {
-                                storage_search_result_free(results, count);
-                                return log_oom(), -ENOMEM;
-                        }
+                                if (!tmp) {
+                                        storage_search_result_free(results, count);
+                                        free(safe_query);
+                                        return log_oom(), -ENOMEM;
+                                }
                         results = tmp;
                 }
 
@@ -521,6 +601,8 @@ int storage_search(
                 sr->rank = sqlite3_column_double(stmt, 9);
                 count++;
         }
+
+        free(safe_query);
 
         *ret_results = results;
         *ret_count = count;

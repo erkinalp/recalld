@@ -14,6 +14,7 @@
 
 #define AI_POLL_INTERVAL_SEC 5
 #define AI_MAX_OUTPUT_SIZE   (4 * 1024 * 1024)  /* 4 MiB */
+#define AI_SUMMARY_MAX_INPUT 8192                  /* truncate input to summariser */
 
 struct AiProcessor {
         QueryServiceConfig config;
@@ -75,6 +76,103 @@ static int run_command(const char *cmd, char **ret_output) {
         return 0;
 }
 
+/* Generate a short summary of the given text using an LLM.
+ *
+ * Uses model_path from configuration as the GGUF model file for
+ * llama-cli (llama.cpp).  If no model is configured or the tool is
+ * not installed, this is a silent no-op — the summary field simply
+ * stays NULL and search still works on the raw transcript/OCR text.
+ *
+ * Returns 0 on success (or graceful skip), negative errno on hard
+ * failure.  Caller must free *ret_summary. */
+static int generate_summary(const AiProcessor *proc, const char *text, char **ret_summary) {
+        char cmd[8192];
+        char *output = NULL;
+        char tmp_path[] = "/tmp/recalld-summ-XXXXXX";
+        int fd, r;
+        size_t text_len;
+
+        if (!ret_summary)
+                return -EINVAL;
+        *ret_summary = NULL;
+
+        /* No model configured — skip silently */
+        if (!proc->config.model_path || !*proc->config.model_path)
+                return 0;
+
+        if (!text || !*text)
+                return 0;
+
+        /* Write the (possibly truncated) input text to a temp file so we
+         * can feed it to the LLM via --file without shell-escaping issues */
+        text_len = strlen(text);
+        if (text_len > AI_SUMMARY_MAX_INPUT)
+                text_len = AI_SUMMARY_MAX_INPUT;
+
+        fd = mkstemp(tmp_path);
+        if (fd < 0)
+                return -errno;
+
+        if (write(fd, text, text_len) < 0) {
+                close(fd);
+                unlink(tmp_path);
+                return -errno;
+        }
+        close(fd);
+
+        /* Build llama-cli command.
+         * --file    : input text
+         * -m        : GGUF model path
+         * -n        : max tokens to generate (from config or default 256)
+         * -c        : context window  (from config or default 2048)
+         * --temp 0.3: low temperature for factual summaries
+         * -ngl 99   : offload all layers to GPU when gpu_acceleration is on
+         * --prompt  : instruction prefix                                    */
+        int max_tok = proc->config.max_tokens > 0 ? proc->config.max_tokens : 256;
+        int ctx     = proc->config.context_window_size > 0 ? proc->config.context_window_size : 2048;
+
+        snprintf(cmd, sizeof(cmd),
+                 "llama-cli -m '%s' -c %d -n %d --temp 0.3%s"
+                 " --prompt 'Summarise the following text in one short paragraph:\\n'"
+                 " --file '%s' 2>/dev/null",
+                 proc->config.model_path, ctx, max_tok,
+                 proc->config.gpu_acceleration ? " -ngl 99" : "",
+                 tmp_path);
+
+        r = run_command(cmd, &output);
+        unlink(tmp_path);
+
+        if (r < 0) {
+                log_debug("Summary generation skipped (llama-cli not available or failed).");
+                return 0;  /* non-fatal */
+        }
+
+        /* Trim leading/trailing whitespace */
+        if (output) {
+                char *start = output;
+                while (*start == ' ' || *start == '\n' || *start == '\r' || *start == '\t')
+                        start++;
+                size_t olen = strlen(start);
+                while (olen > 0 && (start[olen - 1] == ' ' || start[olen - 1] == '\n' ||
+                                    start[olen - 1] == '\r' || start[olen - 1] == '\t'))
+                        olen--;
+
+                if (olen > 0) {
+                        *ret_summary = strndup(start, olen);
+                        if (!*ret_summary) {
+                                free(output);
+                                return log_oom(), -ENOMEM;
+                        }
+                }
+                free(output);
+        }
+
+        if (*ret_summary)
+                log_debug("Generated summary (%zu chars).", strlen(*ret_summary));
+
+        return 0;
+}
+
 /* Process an audio capture through Whisper for speech-to-text. */
 static int process_audio(const AiProcessor *proc, const CaptureMetadata *meta) {
         char cmd[8192];
@@ -111,14 +209,16 @@ static int process_audio(const AiProcessor *proc, const CaptureMetadata *meta) {
 
         /* Build whisper command — use configured audio_model if available */
         const char *model = proc->config.audio_model;
+        const char *device_flag = proc->config.gpu_acceleration ? "" : " --device cpu";
+
         if (model && *model)
                 snprintf(cmd, sizeof(cmd),
-                         "whisper '%s' --model '%s' --output_format txt --output_dir /tmp 2>/dev/null",
-                         tmp_path, model);
+                         "whisper '%s' --model '%s'%s --output_format txt --output_dir /tmp 2>/dev/null",
+                         tmp_path, model, device_flag);
         else
                 snprintf(cmd, sizeof(cmd),
-                         "whisper '%s' --model base --output_format txt --output_dir /tmp 2>/dev/null",
-                         tmp_path);
+                         "whisper '%s' --model base%s --output_format txt --output_dir /tmp 2>/dev/null",
+                         tmp_path, device_flag);
 
         r = run_command(cmd, &transcript);
         unlink(tmp_path);
@@ -154,9 +254,15 @@ static int process_audio(const AiProcessor *proc, const CaptureMetadata *meta) {
                 unlink(txt_path);
         }
 
+        /* Generate a summary from the transcript if an LLM model is configured */
+        char *summary = NULL;
+        if (transcript && *transcript)
+                (void) generate_summary(proc, transcript, &summary);
+
         r = storage_update_text_fields(proc->storage, meta->id,
-                                       transcript, /* ocr_text= */ NULL, /* summary= */ NULL);
+                                       transcript, /* ocr_text= */ NULL, summary);
         free(transcript);
+        free(summary);
 
         if (r < 0)
                 log_warning_errno(-r, "Failed to store transcript for capture %" PRId64 ": %m",
@@ -200,7 +306,13 @@ static int process_visual(const AiProcessor *proc, const CaptureMetadata *meta) 
         close(fd);
         free(data);
 
-        snprintf(cmd, sizeof(cmd), "tesseract '%s' stdout 2>/dev/null", tmp_path);
+        /* Tesseract does not have native GPU support in its CLI; the
+         * --oem flag selects the OCR engine mode.  OEM 1 (LSTM only) is
+         * the fastest neural-network mode available. */
+        if (proc->config.gpu_acceleration)
+                snprintf(cmd, sizeof(cmd), "tesseract '%s' stdout --oem 1 2>/dev/null", tmp_path);
+        else
+                snprintf(cmd, sizeof(cmd), "tesseract '%s' stdout 2>/dev/null", tmp_path);
 
         r = run_command(cmd, &ocr_text);
         unlink(tmp_path);
@@ -212,9 +324,15 @@ static int process_visual(const AiProcessor *proc, const CaptureMetadata *meta) 
                 return 0;
         }
 
+        /* Generate a summary from the OCR text if an LLM model is configured */
+        char *summary = NULL;
+        if (ocr_text && *ocr_text)
+                (void) generate_summary(proc, ocr_text, &summary);
+
         r = storage_update_text_fields(proc->storage, meta->id,
-                                       /* transcript= */ NULL, ocr_text, /* summary= */ NULL);
+                                       /* transcript= */ NULL, ocr_text, summary);
         free(ocr_text);
+        free(summary);
 
         if (r < 0)
                 log_warning_errno(-r, "Failed to store OCR text for capture %" PRId64 ": %m",
